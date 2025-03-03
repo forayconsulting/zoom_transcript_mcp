@@ -1,0 +1,24 @@
+{
+  "name": "zoom-transcripts-server",
+  "version": "1.0.0",
+  "main": "build/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && chmod +x build/index.js",
+    "start": "node build/index.js",
+    "dev": "tsc -w"
+  },
+  "keywords": ["mcp", "zoom", "transcripts"],
+  "author": "",
+  "license": "ISC",
+  "description": "MCP server for managing Zoom Cloud Recording transcripts",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "@types/fs-extra": "^11.0.4",
+    "@types/natural": "^5.1.5",
+    "axios": "^1.8.1",
+    "fs-extra": "^11.3.0",
+    "natural": "^8.0.1",
+    "typescript": "^5.8.2"
+  }
+}
