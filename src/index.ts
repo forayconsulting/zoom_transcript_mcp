@@ -37,7 +37,42 @@ fs.ensureDirSync(TRANSCRIPTS_DIR);
 const tokenizer = new natural.WordTokenizer();
 const stemmer = natural.PorterStemmer;
 
-// Types
+// Types and interfaces
+interface SearchScope {
+  local: {
+    transcriptCount: number;
+    dateRange: string;
+  };
+  cloud?: {
+    availableCount: number;
+    suggestedDownloads: number;
+  };
+}
+
+interface SearchResponse {
+  source: 'local' | 'cloud' | 'mixed' | 'none';
+  searchScope: SearchScope;
+  results: Array<{ metadata: TranscriptMetadata; matches: string[] }>;
+  nextSteps?: {
+    type: 'download_suggestion' | 'broaden_search' | 'refine_query';
+    message: string;
+    action?: {
+      type: string;
+      params: any;
+    };
+  };
+}
+
+interface ActionItem {
+  text: string;
+  speaker: string;
+  target?: string;
+  timestamp: string;
+  meetingId: string;
+  meetingTopic: string;
+  confidence: number;
+}
+
 interface ZoomToken {
   access_token: string;
   token_type: string;
@@ -363,9 +398,39 @@ class FileSystemManager {
     return fs.readFile(filePath, 'utf-8');
   }
   
-  async searchTranscripts(query: string, dateRange?: DateRange): Promise<Array<{ metadata: TranscriptMetadata; matches: string[] }>> {
+  async getTranscriptAvailability(): Promise<{ localCount: number; dateRangeText: string }> {
+    const transcripts = await this.listTranscripts();
+    
+    if (transcripts.length === 0) {
+      return { localCount: 0, dateRangeText: "No local transcripts available" };
+    }
+    
+    // Get date range
+    const startDates = transcripts.map(t => new Date(t.startTime));
+    const oldestDate = new Date(Math.min(...startDates.map(d => d.getTime())));
+    const newestDate = new Date(Math.max(...startDates.map(d => d.getTime())));
+    
+    const formatDate = (date: Date) => date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+    const dateRangeText = `${formatDate(oldestDate)} to ${formatDate(newestDate)}`;
+    
+    return { 
+      localCount: transcripts.length,
+      dateRangeText
+    };
+  }
+  
+  async searchTranscripts(query: string, dateRange?: DateRange): Promise<SearchResponse> {
     const transcripts = await this.listTranscripts(dateRange);
     const results: Array<{ metadata: TranscriptMetadata; matches: string[] }> = [];
+    const availability = await this.getTranscriptAvailability();
+    
+    // Prepare search scope information
+    const searchScope: SearchScope = {
+      local: {
+        transcriptCount: availability.localCount,
+        dateRange: availability.dateRangeText
+      }
+    };
     
     // Tokenize and stem the query
     const queryTokens = tokenizer.tokenize(query.toLowerCase()) || [];
@@ -380,11 +445,15 @@ class FileSystemManager {
         // Process VTT file
         let currentText = '';
         let inCue = false;
+        let speaker = '';
+        let timestamp = '';
         
         for (const line of lines) {
+          // Capture timestamp
           if (line.includes('-->')) {
             inCue = true;
             currentText = '';
+            timestamp = line.trim();
           } else if (line.trim() === '' && inCue) {
             inCue = false;
             
@@ -393,16 +462,19 @@ class FileSystemManager {
               const lineTokens = tokenizer.tokenize(currentText.toLowerCase()) || [];
               const stemmedLineTokens = lineTokens.map(token => stemmer.stem(token));
               
-              // Check if all query tokens are in the line
-              const allTokensFound = stemmedQueryTokens.every(queryToken => 
-                stemmedLineTokens.some(lineToken => lineToken.includes(queryToken))
-              );
-              
-              if (allTokensFound) {
+              // Enhanced matching with flexible token matching
+              const matchScore = this.calculateMatchScore(stemmedQueryTokens, stemmedLineTokens);
+              if (matchScore > 0.6) { // 60% match threshold
                 matches.push(currentText.trim());
               }
             }
           } else if (inCue) {
+            // Extract speaker if available
+            const speakerMatch = line.match(/<v ([^>]+)>/);
+            if (speakerMatch && speakerMatch[1]) {
+              speaker = speakerMatch[1].trim();
+            }
+            
             currentText += ' ' + line;
           }
         }
@@ -415,7 +487,132 @@ class FileSystemManager {
       }
     }
     
-    return results;
+    // Prepare response with next steps if needed
+    let nextSteps;
+    if (results.length === 0) {
+      nextSteps = {
+        type: 'broaden_search' as const,
+        message: 'No matching transcripts found locally. Consider broadening your search terms or checking cloud recordings.',
+        action: {
+          type: 'list_meetings',
+          params: { dateRange }
+        }
+      };
+    }
+    
+    return {
+      source: results.length > 0 ? 'local' : 'none',
+      searchScope,
+      results,
+      nextSteps
+    };
+  }
+  
+  // Helper method to calculate match score between query tokens and line tokens
+  private calculateMatchScore(queryTokens: string[], lineTokens: string[]): number {
+    if (queryTokens.length === 0) return 0;
+    
+    let matchCount = 0;
+    for (const queryToken of queryTokens) {
+      for (const lineToken of lineTokens) {
+        // Check if line token includes the query token or vice versa
+        if (lineToken.includes(queryToken) || queryToken.includes(lineToken)) {
+          matchCount++;
+          break;
+        }
+      }
+    }
+    
+    return matchCount / queryTokens.length;
+  }
+  
+  async extractActionItems(transcriptContent: string, metadata: TranscriptMetadata): Promise<ActionItem[]> {
+    const actionItems: ActionItem[] = [];
+    const lines = transcriptContent.split('\n');
+    
+    // Process VTT file to find action items
+    let currentText = '';
+    let currentTimestamp = '';
+    let currentSpeaker = '';
+    let inCue = false;
+    
+    // Action item indicator phrases
+    const commitmentPhrases = [
+      'i will', 'i\'ll', 'i can', 'let me', 'i should', 'i need to', 
+      'i\'m going to', 'i am going to', 'i must', 'i have to',
+      'send you', 'share with you', 'get back to you', 'follow up with', 
+      'send it', 'email you', 'let you know'
+    ];
+    
+    for (const line of lines) {
+      if (line.includes('-->')) {
+        // This is a timestamp line
+        inCue = true;
+        currentText = '';
+        currentTimestamp = line.trim();
+      } else if (line.trim() === '' && inCue) {
+        // End of text cue
+        inCue = false;
+        const text = currentText.trim();
+        
+        if (text) {
+          // Check if this looks like an action item
+          const lowerText = text.toLowerCase();
+          
+          let isActionItem = false;
+          let confidence = 0;
+          
+          // Check for commitment phrases
+          for (const phrase of commitmentPhrases) {
+            if (lowerText.includes(phrase)) {
+              isActionItem = true;
+              confidence += 0.2; // Increase confidence for each matching phrase
+            }
+          }
+          
+          // Additional heuristics to identify action items
+          if (lowerText.includes('tomorrow') || 
+              lowerText.includes('next week') || 
+              lowerText.includes('later') ||
+              lowerText.match(/by (monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i)) {
+            confidence += 0.2;
+          }
+          
+          // Check if there's a target person
+          let target = undefined;
+          if (currentSpeaker && lowerText.match(/you|your/)) {
+            // Trying to identify who "you" refers to
+            const otherParticipants = metadata.participants.filter(p => p !== currentSpeaker);
+            if (otherParticipants.length === 1) {
+              target = otherParticipants[0];
+              confidence += 0.1;
+            }
+          }
+          
+          if (isActionItem && confidence > 0.3) {
+            actionItems.push({
+              text,
+              speaker: currentSpeaker,
+              target,
+              timestamp: currentTimestamp,
+              meetingId: metadata.meetingId,
+              meetingTopic: metadata.topic,
+              confidence
+            });
+          }
+        }
+      } else if (inCue) {
+        // Extract speaker if available
+        const speakerMatch = line.match(/<v ([^>]+)>/);
+        if (speakerMatch && speakerMatch[1]) {
+          currentSpeaker = speakerMatch[1].trim();
+        }
+        
+        currentText += ' ' + line;
+      }
+    }
+    
+    return actionItems;
   }
 }
 
@@ -457,11 +654,30 @@ class ZoomTranscriptsServer {
   }
   
   private setupToolHandlers() {
+    // Create comprehensive descriptions for the AI model to understand the workflow
+    const toolsIntroduction = `
+      ZOOM TRANSCRIPTS MCP WORKFLOW GUIDE:
+      
+      * ALWAYS check local transcripts first with 'check_local_transcripts' before searching or downloading
+      * ONLY download transcripts when necessary and with user consent
+      * Search locally before querying cloud APIs
+      * Use specific IDs (meetingId or UUID) rather than full meeting titles when downloading
+      
+      RECOMMENDED SEQUENCE:
+      1. check_local_transcripts - See what's available locally
+      2. search_transcripts - Search through existing local transcripts
+      3. list_meetings - Only if local search doesn't yield results
+      4. download_transcript - Only with user consent
+      5. extract_action_items - For finding commitments and tasks
+    `;
+    
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      toolsIntroduction,
       tools: [
         {
           name: 'get_recent_transcripts',
-          description: 'Get and download transcripts from recent Zoom meetings',
+          description: 'Get and download transcripts from recent Zoom meetings. This tool will access the Zoom cloud API to fetch and download recent meeting transcripts.',
+          bestPractices: 'Ask the user before downloading large amounts of transcripts',
           inputSchema: {
             type: 'object',
             properties: {
@@ -476,7 +692,8 @@ class ZoomTranscriptsServer {
         },
         {
           name: 'search_transcripts',
-          description: 'Search across Zoom meeting transcripts for specific content',
+          description: 'Search across Zoom meeting transcripts for specific content. This tool will search through locally stored transcripts first.',
+          bestPractices: 'Try searching locally stored transcripts before requesting to download new ones from the cloud',
           inputSchema: {
             type: 'object',
             properties: {
@@ -502,14 +719,57 @@ class ZoomTranscriptsServer {
           },
         },
         {
-          name: 'download_transcript',
-          description: 'Download a specific Zoom meeting transcript',
+          name: 'extract_action_items',
+          description: 'Identify and extract action items, tasks and commitments from meeting transcripts',
+          bestPractices: 'Use this tool to find commitments, follow-ups, and tasks that were agreed to during meetings',
           inputSchema: {
             type: 'object',
             properties: {
               meetingId: {
                 type: 'string',
-                description: 'Zoom meeting ID',
+                description: 'Meeting ID to extract action items from. Can be either the numeric ID or UUID.',
+              },
+              participant: {
+                type: 'string', 
+                description: 'Optional filter to only show action items from or assigned to a specific participant'
+              }
+            },
+            required: ['meetingId'],
+          },
+        },
+        {
+          name: 'check_local_transcripts',
+          description: 'Check what transcripts are already downloaded and available locally',
+          bestPractices: 'Use this tool first to see what data is available before searching or downloading',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              dateRange: {
+                type: 'object',
+                properties: {
+                  from: {
+                    type: 'string',
+                    description: 'Start date (ISO format)',
+                  },
+                  to: {
+                    type: 'string',
+                    description: 'End date (ISO format)',
+                  },
+                },
+              },
+            },
+          },
+        },
+        {
+          name: 'download_transcript',
+          description: 'Download a specific Zoom meeting transcript from the cloud to local storage',
+          bestPractices: 'Ask the user before downloading transcripts unless specifically requested',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              meetingId: {
+                type: 'string',
+                description: 'Zoom meeting ID or UUID',
               },
             },
             required: ['meetingId'],
@@ -517,7 +777,8 @@ class ZoomTranscriptsServer {
         },
         {
           name: 'list_meetings',
-          description: 'List available Zoom meetings with recordings',
+          description: 'List available Zoom meetings with recordings that exist in the cloud',
+          bestPractices: 'Check local transcripts first before querying the cloud API',
           inputSchema: {
             type: 'object',
             properties: {
@@ -555,6 +816,10 @@ class ZoomTranscriptsServer {
             return await this.handleDownloadTranscript(request.params.arguments);
           case 'list_meetings':
             return await this.handleListMeetings(request.params.arguments);
+          case 'extract_action_items':
+            return await this.handleExtractActionItems(request.params.arguments);
+          case 'check_local_transcripts':
+            return await this.handleCheckLocalTranscripts(request.params.arguments);
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,
@@ -658,36 +923,215 @@ class ZoomTranscriptsServer {
     const query = args.query;
     const dateRange = args.dateRange;
     
-    // Search transcripts
-    const results = await this.fileManager.searchTranscripts(query, dateRange);
+    // Get availability information first
+    const availability = await this.fileManager.getTranscriptAvailability();
     
-    if (results.length === 0) {
+    // Check for participant search patterns
+    const isParticipantSearch = /(from|by|with)\s+([a-z\s]+)/i.test(query);
+    let participantName = null;
+    if (isParticipantSearch) {
+      const match = query.match(/(from|by|with)\s+([a-z\s]+)/i);
+      if (match && match[2]) {
+        participantName = match[2].trim().toLowerCase();
+      }
+    }
+    
+    // Search transcripts
+    const searchResponse = await this.fileManager.searchTranscripts(query, dateRange);
+    
+    // If no results found
+    if (searchResponse.results.length === 0) {
+      // Try to check if there are transcripts with the participant if it's a participant search
+      let participantSuggestion = '';
+      if (participantName) {
+        const transcripts = await this.fileManager.listTranscripts();
+        const meetingsWithParticipant = transcripts.filter(t => 
+          t.participants.some(p => p.toLowerCase().includes(participantName!))
+        );
+        
+        if (meetingsWithParticipant.length > 0) {
+          participantSuggestion = `\n\nFound ${meetingsWithParticipant.length} meetings with participant "${participantName}":\n` +
+            meetingsWithParticipant.slice(0, 5).map(t => 
+              `- "${t.topic}" (${new Date(t.startTime).toLocaleString()})`
+            ).join('\n');
+            
+          if (meetingsWithParticipant.length > 5) {
+            participantSuggestion += `\n  ...and ${meetingsWithParticipant.length - 5} more`;
+          }
+          
+          participantSuggestion += `\n\nTry searching with more specific terms about what was discussed.`;
+        }
+      }
+      
+      // Try to check cloud recordings if we have very few local recordings
+      let cloudSuggestion = '';
+      if (availability.localCount < 3) {
+        try {
+          const cloudRecordings = await this.zoomClient.listRecordings({
+            page_size: 5,
+            from: '2024-01-01',
+          });
+          
+          if (cloudRecordings.meetings && cloudRecordings.meetings.length > 0) {
+            cloudSuggestion = `\n\nThere are ${cloudRecordings.meetings.length}+ cloud recordings available. Consider using 'get_recent_transcripts' to download some for searching.`;
+          }
+        } catch (error) {
+          console.error('Error checking cloud recordings:', error);
+        }
+      }
+      
+      // Check if we should suggest looking at cloud recordings
+      if (searchResponse.nextSteps) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `🔍 No matches found for "${query}" in local transcripts.\n\n` +
+                     `LOCAL TRANSCRIPT INFO:\n` +
+                     `- Available: ${searchResponse.searchScope.local.transcriptCount} transcripts\n` +
+                     `- Date range: ${searchResponse.searchScope.local.dateRange}\n\n` +
+                     `SUGGESTIONS:\n` +
+                     `- Try different search terms or fewer keywords\n` +
+                     `- Check if you need to download more transcripts${participantSuggestion}${cloudSuggestion}`
+            }
+          ]
+        };
+      }
+      
       return {
         content: [
           {
             type: 'text',
-            text: `No results found for query: "${query}"`,
-          },
-        ],
+            text: `No results found for query: "${query}"`
+          }
+        ]
       };
     }
     
-    // Format results
-    const formattedResults = results.map(result => {
-      const { metadata, matches } = result;
-      const meetingDate = new Date(metadata.startTime).toLocaleString();
+    // Group results by relevance
+    const highRelevanceResults = [];
+    const mediumRelevanceResults = [];
+    
+    for (const result of searchResponse.results) {
+      // Calculate relevance based on number of matches and how recent the meeting is
+      const matchCount = result.matches.length;
+      const meetingDate = new Date(result.metadata.startTime);
+      const daysSinceNow = Math.floor((Date.now() - meetingDate.getTime()) / (1000 * 60 * 60 * 24));
       
-      return `Meeting: ${metadata.topic} (${meetingDate})\n` +
-        `Matches:\n${matches.map(match => `- "${match}"`).join('\n')}`;
-    }).join('\n\n');
+      // Simple relevance scoring
+      const isHighRelevance = matchCount > 5 || daysSinceNow < 30;
+      
+      if (isHighRelevance) {
+        highRelevanceResults.push(result);
+      } else {
+        mediumRelevanceResults.push(result);
+      }
+    }
+    
+    // Format results by relevance groups
+    let formattedResults = '';
+    
+    if (highRelevanceResults.length > 0) {
+      formattedResults += `BEST MATCHES:\n\n`;
+      formattedResults += highRelevanceResults.map(result => {
+        const { metadata, matches } = result;
+        const meetingDate = new Date(metadata.startTime).toLocaleString();
+        const topMatches = matches.slice(0, 5);
+        const hasMoreMatches = matches.length > 5;
+        
+        return `📝 Meeting: ${metadata.topic} (${meetingDate})\n` +
+               `   ID: ${metadata.meetingId}\n` +
+               `   Participants: ${metadata.participants.join(', ')}\n` +
+               `   Matches (${matches.length}):\n${topMatches.map(match => `   - "${match}"`).join('\n')}` +
+               (hasMoreMatches ? `\n   ...and ${matches.length - 5} more matches` : '');
+      }).join('\n\n');
+    }
+    
+    if (mediumRelevanceResults.length > 0) {
+      if (formattedResults) formattedResults += '\n\n';
+      formattedResults += `OTHER MATCHES:\n\n`;
+      formattedResults += mediumRelevanceResults.map(result => {
+        const { metadata, matches } = result;
+        const meetingDate = new Date(metadata.startTime).toLocaleString();
+        const topMatches = matches.slice(0, 3);
+        const hasMoreMatches = matches.length > 3;
+        
+        return `📝 Meeting: ${metadata.topic} (${meetingDate})\n` +
+               `   ID: ${metadata.meetingId}\n` +
+               `   Matches (${matches.length}):\n${topMatches.map(match => `   - "${match}"`).join('\n')}` +
+               (hasMoreMatches ? `\n   ...and ${matches.length - 3} more matches` : '');
+      }).join('\n\n');
+    }
+    
+    // See if we can find any action items related to the search
+    let actionItemsText = '';
+    try {
+      let actionItems: ActionItem[] = [];
+      // Check if the search is looking for action items or tasks
+      const isActionItemSearch = query.toLowerCase().includes('action') || 
+                                 query.toLowerCase().includes('task') || 
+                                 query.toLowerCase().includes('todo') ||
+                                 query.toLowerCase().includes('to do') ||
+                                 query.toLowerCase().includes('follow up');
+      
+      if (isActionItemSearch) {
+        for (const result of searchResponse.results) {
+          const transcriptContent = await this.fileManager.readTranscript(result.metadata.filePath);
+          const meetingActionItems = await this.fileManager.extractActionItems(transcriptContent, result.metadata);
+          actionItems = [...actionItems, ...meetingActionItems];
+        }
+        
+        if (actionItems.length > 0) {
+          // Sort action items by confidence
+          actionItems.sort((a, b) => b.confidence - a.confidence);
+          
+          actionItemsText = '\n\n🔔 DETECTED ACTION ITEMS:\n';
+          
+          // Group by meeting
+          const itemsByMeeting: Record<string, ActionItem[]> = {};
+          for (const item of actionItems) {
+            if (!itemsByMeeting[item.meetingId]) {
+              itemsByMeeting[item.meetingId] = [];
+            }
+            itemsByMeeting[item.meetingId].push(item);
+          }
+          
+          // Format by meeting
+          for (const [meetingId, items] of Object.entries(itemsByMeeting)) {
+            const meeting = items[0].meetingTopic;
+            actionItemsText += `\nFrom "${meeting}":\n`;
+            
+            for (const item of items) {
+              const confidenceMarker = item.confidence > 0.7 ? '🔥' : (item.confidence > 0.5 ? '✓' : '❓');
+              let actionText = `${confidenceMarker} ${item.speaker}: "${item.text.trim()}"`;
+              if (item.target) {
+                actionText += ` (assigned to: ${item.target})`;
+              }
+              actionItemsText += `${actionText}\n`;
+            }
+          }
+          
+          // Add a tip for getting more action items
+          actionItemsText += `\nTip: Use 'extract_action_items' with a specific meeting ID for more detailed action items.`;
+        }
+      }
+    } catch (error) {
+      console.error('Error extracting action items:', error);
+      // Continue without action items if there's an error
+    }
+    
+    // Add summary section
+    const summary = `🔍 SEARCH RESULTS FOR: "${query}"\n\n` +
+                   `Found ${searchResponse.results.length} meetings with ${searchResponse.results.reduce((sum, r) => sum + r.matches.length, 0)} total matches.\n` +
+                   `Local transcripts: ${searchResponse.searchScope.local.transcriptCount} available (${searchResponse.searchScope.local.dateRange})`;
     
     return {
       content: [
         {
           type: 'text',
-          text: `Found ${results.length} meetings with matches for "${query}":\n\n${formattedResults}`,
-        },
-      ],
+          text: `${summary}\n\n${formattedResults}${actionItemsText}`
+        }
+      ]
     };
   }
   
@@ -901,6 +1345,336 @@ class ZoomTranscriptsServer {
           },
         ],
         isError: true,
+      };
+    }
+  }
+  
+  private async handleExtractActionItems(args: any): Promise<any> {
+    if (!args?.meetingId) {
+      throw new McpError(ErrorCode.InvalidParams, 'Meeting ID is required');
+    }
+    
+    const meetingId = args.meetingId;
+    const participantFilter = args.participant?.toLowerCase();
+    
+    try {
+      // First check if we have the transcript locally - more flexible matching
+      const transcripts = await this.fileManager.listTranscripts();
+      
+      // Try multiple matching strategies
+      let existingTranscript = transcripts.find(t => 
+        t.meetingId === meetingId || t.id === meetingId
+      );
+      
+      // If not found directly, try to match by title or partial ID
+      if (!existingTranscript) {
+        existingTranscript = transcripts.find(t => 
+          t.topic.includes(meetingId) || meetingId.includes(t.meetingId) || meetingId.includes(t.id)
+        );
+      }
+      
+      // If still not found, try using substring or fuzzy matching
+      if (!existingTranscript && meetingId.length > 5) {
+        existingTranscript = transcripts.find(t => 
+          t.meetingId.includes(meetingId) || meetingId.includes(t.meetingId) ||
+          t.id.includes(meetingId) || meetingId.includes(t.id) ||
+          t.topic.toLowerCase().includes(meetingId.toLowerCase())
+        );
+      }
+      
+      if (existingTranscript) {
+        // We have the transcript locally, extract action items
+        const transcriptContent = await this.fileManager.readTranscript(existingTranscript.filePath);
+        let actionItems = await this.fileManager.extractActionItems(transcriptContent, existingTranscript);
+        
+        // Apply participant filter if provided
+        if (participantFilter) {
+          actionItems = actionItems.filter(item => 
+            item.speaker.toLowerCase().includes(participantFilter) || 
+            (item.target && item.target.toLowerCase().includes(participantFilter))
+          );
+        }
+        
+        // Sort by confidence (highest first)
+        actionItems.sort((a, b) => b.confidence - a.confidence);
+        
+        if (actionItems.length === 0) {
+          // Suggest other meetings with the participant if filter applied
+          if (participantFilter) {
+            const meetingsWithParticipant = transcripts.filter(t => 
+              t.participants.some(p => p.toLowerCase().includes(participantFilter))
+            ).map(t => `- "${t.topic}" (${new Date(t.startTime).toLocaleString()}) - ID: ${t.meetingId}`);
+            
+            if (meetingsWithParticipant.length > 0) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: `No action items found in meeting "${existingTranscript.topic}" for participant "${participantFilter}".\n\nOther meetings with this participant:\n${meetingsWithParticipant.join('\n')}`
+                  }
+                ]
+              };
+            }
+          }
+          
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `No action items found in meeting "${existingTranscript.topic}" (${new Date(existingTranscript.startTime).toLocaleString()})${
+                  participantFilter ? ` matching participant filter "${participantFilter}"` : ''
+                }.`
+              }
+            ]
+          };
+        }
+        
+        // Group action items by speaker
+        const actionItemsByOwner = new Map<string, ActionItem[]>();
+        for (const item of actionItems) {
+          const owner = item.target || item.speaker;
+          if (!actionItemsByOwner.has(owner)) {
+            actionItemsByOwner.set(owner, []);
+          }
+          actionItemsByOwner.get(owner)!.push(item);
+        }
+        
+        // Format results
+        let formattedOutput = `Found ${actionItems.length} action items in meeting "${existingTranscript.topic}" (${new Date(existingTranscript.startTime).toLocaleString()}):\n\n`;
+        
+        // Add meeting participants for context
+        formattedOutput += `Meeting participants: ${existingTranscript.participants.join(', ')}\n\n`;
+        
+        // List action items grouped by owner
+        for (const [owner, items] of actionItemsByOwner.entries()) {
+          formattedOutput += `ITEMS FOR ${owner.toUpperCase()}:\n`;
+          formattedOutput += items.map(item => {
+            const confidenceMarker = item.confidence > 0.7 ? '🔥' : (item.confidence > 0.5 ? '✓' : '❓');
+            let actionText = `${confidenceMarker} "${item.text.trim()}"`;
+            if (item.speaker !== owner) {
+              actionText += ` (from: ${item.speaker})`;
+            }
+            return actionText;
+          }).join('\n');
+          formattedOutput += '\n\n';
+        }
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: formattedOutput
+            }
+          ]
+        };
+      } else {
+        // We don't have the transcript locally, check available transcripts
+        const availability = await this.fileManager.getTranscriptAvailability();
+        
+        // Check if this ID might be in cloud recordings
+        try {
+          const cloudRecordings = await this.zoomClient.listRecordings({
+            page_size: 30,
+            from: '2024-01-01',
+          });
+          
+          const matchingCloudMeeting = cloudRecordings.meetings?.find((m: ZoomMeeting) => 
+            m.id === meetingId || 
+            m.uuid === meetingId || 
+            m.topic.includes(meetingId) || 
+            meetingId.includes(m.topic)
+          );
+          
+          if (matchingCloudMeeting) {
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `Found meeting "${matchingCloudMeeting.topic}" in cloud recordings, but it needs to be downloaded first.\n\nPlease use this command to download it:\n\ndownload_transcript with meetingId: "${matchingCloudMeeting.id}"`
+                }
+              ]
+            };
+          }
+        } catch (error) {
+          console.error('Error checking cloud recordings:', error);
+          // Continue with local-only suggestion
+        }
+        
+        // List available transcripts for context
+        const recentTranscripts = transcripts.slice(0, 5).map(t => 
+          `- "${t.topic}" (${new Date(t.startTime).toLocaleString()}) - ID: ${t.meetingId}`
+        );
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Transcript for meeting ID "${meetingId}" not found locally.\n\nLocal transcript availability:\n- Count: ${availability.localCount}\n- Date range: ${availability.dateRangeText}\n\nRecent meetings available locally:\n${recentTranscripts.join('\n')}\n\nTo search for specific content, use search_transcripts with your query.`
+            }
+          ]
+        };
+      }
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error extracting action items: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+  
+  private async handleCheckLocalTranscripts(args: any): Promise<any> {
+    const dateRange = args?.dateRange;
+    
+    try {
+      // Get local transcripts
+      const transcripts = await this.fileManager.listTranscripts(dateRange);
+      const availability = await this.fileManager.getTranscriptAvailability();
+      
+      // Try to check cloud recordings count for context
+      let cloudInfo = '';
+      try {
+        const cloudRecordings = await this.zoomClient.listRecordings({
+          page_size: 10,
+          from: '2024-01-01',
+        });
+        
+        if (cloudRecordings.meetings && cloudRecordings.meetings.length > 0) {
+          cloudInfo = `\n\n🌥️ CLOUD AVAILABILITY:\n` +
+                      `${cloudRecordings.meetings.length}+ transcripts available in Zoom Cloud`;
+        }
+      } catch (error) {
+        console.error('Error checking cloud recordings:', error);
+        // Continue without cloud info
+      }
+      
+      // Create stats about participants
+      const participantStats: Record<string, { count: number, meetingIds: string[] }> = {};
+      for (const transcript of transcripts) {
+        for (const participant of transcript.participants) {
+          if (!participantStats[participant]) {
+            participantStats[participant] = { count: 0, meetingIds: [] };
+          }
+          participantStats[participant].count++;
+          participantStats[participant].meetingIds.push(transcript.meetingId);
+        }
+      }
+      
+      // Sort participants by frequency
+      const topParticipants = Object.entries(participantStats)
+        .sort(([, a], [, b]) => b.count - a.count)
+        .slice(0, 10);
+      
+      if (transcripts.length === 0) {
+        // Provide suggestions if no transcripts found
+        let suggestions = '';
+        
+        if (dateRange) {
+          suggestions = 'Try removing date filters or downloading transcripts from the cloud.';
+        } else {
+          suggestions = 'Use get_recent_transcripts to fetch recent meetings from the cloud.';
+        }
+        
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `📂 NO LOCAL TRANSCRIPTS FOUND\n\n` +
+                    `${suggestions}${cloudInfo}`
+            }
+          ]
+        };
+      }
+      
+      // Group transcripts by month
+      const transcriptsByMonth: Record<string, TranscriptMetadata[]> = {};
+      
+      for (const transcript of transcripts) {
+        const date = new Date(transcript.startTime);
+        const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+        
+        if (!transcriptsByMonth[monthKey]) {
+          transcriptsByMonth[monthKey] = [];
+        }
+        
+        transcriptsByMonth[monthKey].push(transcript);
+      }
+      
+      // Format results - Start with summary
+      let output = `📂 LOCAL TRANSCRIPT SUMMARY\n\n` +
+                   `AVAILABILITY:\n` + 
+                   `- ${transcripts.length} transcripts locally\n` + 
+                   `- Date range: ${availability.dateRangeText}\n` +
+                   `- ${Object.keys(participantStats).length} unique participants\n`;
+      
+      // Add top participants if we have enough
+      if (topParticipants.length > 3) {
+        output += `\nMOST FREQUENT PARTICIPANTS:\n`;
+        for (let i = 0; i < Math.min(5, topParticipants.length); i++) {
+          const [name, stats] = topParticipants[i];
+          output += `- ${name} (${stats.count} meetings)\n`;
+        }
+      }
+                   
+      // Add cloud info if available
+      if (cloudInfo) {
+        output += cloudInfo;
+      }
+      
+      output += `\n\nTRANSCRIPT LISTING:\n`;
+      
+      // Sort months chronologically (newest first)
+      const sortedMonths = Object.keys(transcriptsByMonth).sort().reverse();
+      
+      for (const month of sortedMonths) {
+        const monthTranscripts = transcriptsByMonth[month];
+        const [year, monthNum] = month.split('-');
+        const monthName = new Date(parseInt(year), parseInt(monthNum) - 1, 1).toLocaleString('en-US', { month: 'long' });
+        
+        output += `\n${monthName} ${year} (${monthTranscripts.length} transcripts):\n`;
+        
+        // List first 5 transcripts for this month with participants
+        for (let i = 0; i < Math.min(5, monthTranscripts.length); i++) {
+          const t = monthTranscripts[i];
+          output += `- ${t.topic} (${new Date(t.startTime).toLocaleString()})\n`;
+          output += `  ID: ${t.meetingId} | Participants: ${t.participants.length > 3 ? 
+            t.participants.slice(0, 3).join(', ') + ` +${t.participants.length - 3} more` : 
+            t.participants.join(', ')}\n`;
+        }
+        
+        // If there are more transcripts, show a count
+        if (monthTranscripts.length > 5) {
+          output += `  ...and ${monthTranscripts.length - 5} more meetings this month\n`;
+        }
+      }
+      
+      // Add usage tips
+      output += `\n\nNEXT STEPS:\n` +
+                `- To search transcripts: search_transcripts with query: "your search terms"\n` +
+                `- To find action items: extract_action_items with meetingId: "meeting_id_here"\n` +
+                `- To get more transcripts: get_recent_transcripts`;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: output
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error checking local transcripts: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
       };
     }
   }
