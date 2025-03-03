@@ -71,9 +71,9 @@ Alternatively, you can configure the server through your MCP settings file:
 3. Choose "Server-to-Server OAuth" app type
 4. Fill in the required information
 5. Under "Scopes", add the following permissions:
-   - `recording:read:admin`
-   - `recording:write:admin`
-   - `user:read:admin`
+   - `cloud_recording:read:list_account_recordings:admin`
+   - `cloud_recording:read:recording:admin`
+   - `cloud_recording:read:list_user_recordings:admin`
 6. Save and activate your app
 7. Note your Account ID, Client ID, and Client Secret
 
