@@ -2,9 +2,9 @@
 import axios from 'axios';
 
 // Zoom API credentials
-const ACCOUNT_ID = '51O9ac6FQhaQLN8w-LhDNg';
-const CLIENT_ID = 'XyyVNCoQtuiqvvlH0DNlA';
-const CLIENT_SECRET = '4Zo3luKvW0Qg6gwVYkIfkrwgNiDTiZCh';
+const ACCOUNT_ID = 'youraccountidhere';
+const CLIENT_ID = 'yourclientidhere';
+const CLIENT_SECRET = 'yourclientsecrethere';
 
 async function testZoomAPI() {
   try {
