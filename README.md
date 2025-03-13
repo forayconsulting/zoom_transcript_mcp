@@ -2,6 +2,10 @@
 
 An MCP (Model Context Protocol) server for interacting with Zoom Cloud Recording transcripts. This server allows you to list, download, search, and manage your Zoom meeting transcripts through a structured interface.
 
+<a href="https://glama.ai/mcp/servers/b01uqjtp7w">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/b01uqjtp7w/badge" alt="Zoom Transcript Server MCP server" />
+</a>
+
 ## Features
 
 - **List Meetings**: View all available Zoom meetings with recordings
